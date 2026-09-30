@@ -1,0 +1,24 @@
+# Environment credentials
+.env
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite3
+
+# Gateway generated temp & backup files
+gateway_configs/
+*.candidate
+*.bak
+*.tmp
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
