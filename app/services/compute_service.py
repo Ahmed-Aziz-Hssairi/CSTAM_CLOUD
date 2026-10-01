@@ -50,7 +50,7 @@ class ComputeService:
         if not images:
             raise Exception("No images found in OpenStack Glance.")
 
-        if img_name:
+        if img_name and img_name.strip().lower() not in ["string", "none", "null", ""]:
             target = img_name.strip().lower()
             for img in images:
                 if img.id == img_name:
@@ -62,9 +62,9 @@ class ComputeService:
                 if img.name and target in img.name.lower():
                     return img
 
-        # Fallback: CirrOS or first active image
+        # Fallback to configured default (e.g. CirrOS) or first active image
         for img in images:
-            if img.name and "cirros" in img.name.lower():
+            if img.name and (self.default_image.lower() in img.name.lower() or "cirros" in img.name.lower()):
                 return img
         return images[0]
 
@@ -74,7 +74,7 @@ class ComputeService:
         if not flavors:
             raise Exception("No flavors found in OpenStack Nova.")
 
-        if flav_name:
+        if flav_name and flav_name.strip().lower() not in ["string", "none", "null", ""]:
             target = flav_name.strip().lower()
             for f in flavors:
                 if f.id == flav_name or (f.name and f.name.lower() == target):
@@ -83,9 +83,9 @@ class ComputeService:
                 if f.name and target in f.name.lower():
                     return f
 
-        # Fallback: G0.basic.1c1g or smallest flavor
+        # Fallback to configured default (e.g. G0.basic.1c1g) or smallest flavor
         for f in flavors:
-            if f.name and "g0.basic.1c1g" in f.name.lower():
+            if f.name and (self.default_flavor.lower() in f.name.lower() or "g0.basic.1c1g" in f.name.lower()):
                 return f
         flavors.sort(key=lambda x: x.ram or 999999)
         return flavors[0]
@@ -276,4 +276,56 @@ class ComputeService:
                 "created_at": getattr(s, "created_at", None)
             })
         return sandboxes
+
+    def stop_sandbox_vm(self, team_name_or_id: str) -> Dict:
+        """Powers off (SHUTOFF) an OpenStack VM instance."""
+        target = team_name_or_id.strip()
+        vm_name = f"sbx-{target.lower()}" if not target.startswith("sbx-") else target
+        
+        server = self.conn.compute.find_server(vm_name) or self.conn.compute.find_server(target)
+        if not server:
+            raise Exception(f"OpenStack instance '{vm_name}' not found.")
+        
+        self.conn.compute.stop_server(server)
+        return {
+            "server_id": server.id,
+            "server_name": server.name,
+            "action": "shutoff_initiated",
+            "previous_status": server.status
+        }
+
+    def start_sandbox_vm(self, team_name_or_id: str) -> Dict:
+        """Starts / powers on (ACTIVE) a SHUTOFF OpenStack VM instance."""
+        target = team_name_or_id.strip()
+        vm_name = f"sbx-{target.lower()}" if not target.startswith("sbx-") else target
+        
+        server = self.conn.compute.find_server(vm_name) or self.conn.compute.find_server(target)
+        if not server:
+            raise Exception(f"OpenStack instance '{vm_name}' not found.")
+        
+        self.conn.compute.start_server(server)
+        return {
+            "server_id": server.id,
+            "server_name": server.name,
+            "action": "start_initiated",
+            "previous_status": server.status
+        }
+
+    def reboot_sandbox_vm(self, team_name_or_id: str, reboot_type: str = "SOFT") -> Dict:
+        """Reboots an OpenStack VM instance."""
+        target = team_name_or_id.strip()
+        vm_name = f"sbx-{target.lower()}" if not target.startswith("sbx-") else target
+        
+        server = self.conn.compute.find_server(vm_name) or self.conn.compute.find_server(target)
+        if not server:
+            raise Exception(f"OpenStack instance '{vm_name}' not found.")
+        
+        self.conn.compute.reboot_server(server, reboot_type=reboot_type)
+        return {
+            "server_id": server.id,
+            "server_name": server.name,
+            "action": f"reboot_{reboot_type.lower()}_initiated",
+            "previous_status": server.status
+        }
+
 

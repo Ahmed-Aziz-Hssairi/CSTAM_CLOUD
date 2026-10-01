@@ -48,18 +48,24 @@ class IPAMService:
                         allocated_to TEXT UNIQUE,
                         allocated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         lease_duration_seconds INTEGER DEFAULT 3600,
-                        expires_at TIMESTAMP
+                        expires_at TIMESTAMP,
+                        last_activity_at TIMESTAMP,
+                        shutoff_since TIMESTAMP
                     )
                 """)
                 conn.commit()
 
-                # Migration check if table existed without expires_at
+                # Migration checks for existing databases
                 cursor.execute("PRAGMA table_info(ip_pool)")
                 columns = [col[1] for col in cursor.fetchall()]
                 if "lease_duration_seconds" not in columns:
                     cursor.execute("ALTER TABLE ip_pool ADD COLUMN lease_duration_seconds INTEGER DEFAULT 3600")
                 if "expires_at" not in columns:
                     cursor.execute("ALTER TABLE ip_pool ADD COLUMN expires_at TIMESTAMP")
+                if "last_activity_at" not in columns:
+                    cursor.execute("ALTER TABLE ip_pool ADD COLUMN last_activity_at TIMESTAMP")
+                if "shutoff_since" not in columns:
+                    cursor.execute("ALTER TABLE ip_pool ADD COLUMN shutoff_since TIMESTAMP")
                 conn.commit()
 
                 # Seed IP pool if empty
@@ -140,9 +146,11 @@ class IPAMService:
                         allocated_to = ?, 
                         allocated_at = ?, 
                         lease_duration_seconds = ?, 
-                        expires_at = ?
+                        expires_at = ?,
+                        last_activity_at = ?,
+                        shutoff_since = NULL
                     WHERE ip_address = ?
-                """, (team_name, now_str, duration, expires_at_str, allocated_ip))
+                """, (team_name, now_str, duration, expires_at_str, now_str, allocated_ip))
                 conn.commit()
 
                 return {
@@ -152,6 +160,43 @@ class IPAMService:
                     "expires_at": expires_at_str,
                     "status": "allocated"
                 }
+
+    def record_activity(self, team_name: str) -> bool:
+        """Updates last_activity_at timestamp to now (Heartbeat / HTTP traffic hit)."""
+        team_name = team_name.strip().lower()
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE ip_pool
+                    SET last_activity_at = ?
+                    WHERE allocated_to = ? AND is_allocated = 1
+                """, (now_str, team_name))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def update_shutoff_state(self, team_name: str, is_shutoff: bool) -> bool:
+        """Tracks when a VM enters SHUTOFF state, or resets it when ACTIVE."""
+        team_name = team_name.strip().lower()
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if is_shutoff:
+                    cursor.execute("""
+                        UPDATE ip_pool
+                        SET shutoff_since = COALESCE(shutoff_since, ?)
+                        WHERE allocated_to = ? AND is_allocated = 1
+                    """, (now_str, team_name))
+                else:
+                    cursor.execute("""
+                        UPDATE ip_pool
+                        SET shutoff_since = NULL
+                        WHERE allocated_to = ? AND is_allocated = 1
+                    """, (team_name,))
+                conn.commit()
+                return cursor.rowcount > 0
 
     def release_ip(self, team_name: str) -> Optional[str]:
         """
@@ -174,7 +219,8 @@ class IPAMService:
                 cursor.execute("""
                     UPDATE ip_pool
                     SET is_allocated = 0, allocated_to = NULL, allocated_at = NULL, 
-                        lease_duration_seconds = NULL, expires_at = NULL
+                        lease_duration_seconds = NULL, expires_at = NULL,
+                        last_activity_at = NULL, shutoff_since = NULL
                     WHERE ip_address = ?
                 """, (released_ip,))
                 conn.commit()
@@ -187,36 +233,76 @@ class IPAMService:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT ip_address, allocated_to, allocated_at, lease_duration_seconds, expires_at FROM ip_pool WHERE allocated_to = ?",
+                "SELECT ip_address, allocated_to, allocated_at, lease_duration_seconds, expires_at, last_activity_at, shutoff_since FROM ip_pool WHERE allocated_to = ?",
                 (team_name,)
             )
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def reclaim_expired_leases(self) -> List[Dict]:
+    def reclaim_expired_leases(
+        self,
+        idle_timeout_seconds: Optional[int] = None,
+        shutoff_timeout_seconds: Optional[int] = None
+    ) -> List[Dict]:
         """
-        Scans and reclaims any IP whose lease has expired.
-        Returns the list of reclaimed allocations.
+        Multi-Factor Reclamation Engine:
+        1. Base Expiry: Lease duration expired (expires_at <= now).
+        2. Method 1 (Idle Traffic): Inactive for > idle_timeout_seconds.
+        3. Method 4 (Prolonged Shutoff): Stopped / SHUTOFF for > shutoff_timeout_seconds.
         """
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.utcnow()
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        
+        idle_cutoff_str = None
+        if idle_timeout_seconds and idle_timeout_seconds > 0:
+            idle_cutoff_str = (now - timedelta(seconds=idle_timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+        shutoff_cutoff_str = None
+        if shutoff_timeout_seconds and shutoff_timeout_seconds > 0:
+            shutoff_cutoff_str = (now - timedelta(seconds=shutoff_timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
         with self.lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT ip_address, allocated_to, expires_at
+
+                query = """
+                    SELECT ip_address, allocated_to, expires_at, last_activity_at, shutoff_since,
+                           CASE 
+                               WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 'lease_expired'
+                               WHEN ? IS NOT NULL AND last_activity_at IS NOT NULL AND last_activity_at <= ? THEN 'idle_traffic_timeout'
+                               WHEN ? IS NOT NULL AND shutoff_since IS NOT NULL AND shutoff_since <= ? THEN 'shutoff_timeout'
+                               ELSE 'unknown'
+                           END as reclamation_reason
                     FROM ip_pool
-                    WHERE is_allocated = 1 AND expires_at IS NOT NULL AND expires_at < ?
-                """, (now_str,))
+                    WHERE is_allocated = 1 AND (
+                        (expires_at IS NOT NULL AND expires_at <= ?)
+                        OR (? IS NOT NULL AND last_activity_at IS NOT NULL AND last_activity_at <= ?)
+                        OR (? IS NOT NULL AND shutoff_since IS NOT NULL AND shutoff_since <= ?)
+                    )
+                """
+                params = (
+                    now_str,
+                    idle_cutoff_str, idle_cutoff_str,
+                    shutoff_cutoff_str, shutoff_cutoff_str,
+                    now_str,
+                    idle_cutoff_str, idle_cutoff_str,
+                    shutoff_cutoff_str, shutoff_cutoff_str
+                )
+
+                cursor.execute(query, params)
                 expired_rows = cursor.fetchall()
                 reclaimed = [dict(r) for r in expired_rows]
 
                 if reclaimed:
-                    cursor.execute("""
+                    ips_to_free = [r["ip_address"] for r in reclaimed]
+                    placeholders = ",".join("?" * len(ips_to_free))
+                    cursor.execute(f"""
                         UPDATE ip_pool
                         SET is_allocated = 0, allocated_to = NULL, allocated_at = NULL,
-                            lease_duration_seconds = NULL, expires_at = NULL
-                        WHERE is_allocated = 1 AND expires_at IS NOT NULL AND expires_at < ?
-                    """, (now_str,))
+                            lease_duration_seconds = NULL, expires_at = NULL,
+                            last_activity_at = NULL, shutoff_since = NULL
+                        WHERE ip_address IN ({placeholders})
+                    """, ips_to_free)
                     conn.commit()
 
                 return reclaimed
@@ -226,7 +312,7 @@ class IPAMService:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT ip_address, allocated_to as team_name, allocated_at, lease_duration_seconds, expires_at
+                SELECT ip_address, allocated_to as team_name, allocated_at, lease_duration_seconds, expires_at, last_activity_at, shutoff_since
                 FROM ip_pool
                 WHERE is_allocated = 1
                 ORDER BY ip_address ASC

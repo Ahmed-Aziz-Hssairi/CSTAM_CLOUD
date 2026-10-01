@@ -36,6 +36,11 @@ class SandboxService:
         # Public Floating IP of the HA Edge Gateways (reachable from Internet)
         self.gateway_public_ip = os.getenv("GATEWAY_FLOATING_IP", os.getenv("GATEWAY_PUBLIC_IP", "10.0.0.5"))
 
+        # Timeout configurations (in seconds)
+        self.idle_timeout = int(os.getenv("IPAM_IDLE_TIMEOUT_SECONDS", "1800"))       # 30 min idle traffic
+        self.shutoff_timeout = int(os.getenv("IPAM_SHUTOFF_TIMEOUT_SECONDS", "600"))  # 10 min prolonged shutoff
+
+
     def create_sandbox(
         self,
         team_name: str,
@@ -149,15 +154,43 @@ class SandboxService:
             "dns_cleanup": dns_result
         }
 
+    def record_traffic(self, team_name: str) -> bool:
+        """Records network/HTTP traffic activity for a team to reset idle timer."""
+        return self.ipam.record_activity(team_name)
+
     def reclaim_expired(self) -> Dict:
         """
-        Reclamation Engine: Identifies expired IP leases and purges associated resources.
+        Multi-Factor Auto-Reclamation Engine:
+        1. Scans OpenStack Nova instances: flags SHUTOFF instances to start grace period.
+        2. Reclaims expired leases, idle sandboxes (> idle_timeout), and abandoned shutoff VMs (> shutoff_timeout).
+        3. Cascades teardown across Gateway (HAProxy), Designate DNS, and Nova/Neutron.
         """
-        expired_allocations = self.ipam.reclaim_expired_leases()
+        # Step 1: Sync OpenStack VM state (Detect SHUTOFF vs ACTIVE)
+        try:
+            live_vms = self.compute.list_sandbox_vms(include_all=True)
+            for vm in live_vms:
+                team = vm.get("team_name")
+                status = str(vm.get("status", "")).upper()
+                if team:
+                    if status == "SHUTOFF":
+                        self.ipam.update_shutoff_state(team, is_shutoff=True)
+                    elif status == "ACTIVE":
+                        self.ipam.update_shutoff_state(team, is_shutoff=False)
+        except Exception as e:
+            logger.debug(f"OpenStack shutoff state poll error: {e}")
+
+        # Step 2: Multi-Factor Reclamation
+        idle_t = getattr(self, "idle_timeout", int(os.getenv("IPAM_IDLE_TIMEOUT_SECONDS", "1800")))
+        shutoff_t = getattr(self, "shutoff_timeout", int(os.getenv("IPAM_SHUTOFF_TIMEOUT_SECONDS", "600")))
+        expired_allocations = self.ipam.reclaim_expired_leases(
+            idle_timeout_seconds=idle_t,
+            shutoff_timeout_seconds=shutoff_t
+        )
         reclaimed_teams = []
 
         for item in expired_allocations:
             team_name = item["allocated_to"]
+            reason = item.get("reclamation_reason", "lease_expired")
             if team_name:
                 self.gateway.remove_route(team_name)
                 try:
@@ -171,7 +204,10 @@ class SandboxService:
                 reclaimed_teams.append({
                     "team_name": team_name,
                     "ip_address": item["ip_address"],
-                    "expires_at": item.get("expires_at")
+                    "reason": reason,
+                    "expires_at": item.get("expires_at"),
+                    "last_activity_at": item.get("last_activity_at"),
+                    "shutoff_since": item.get("shutoff_since")
                 })
 
         return {
@@ -250,4 +286,18 @@ class SandboxService:
                 })
 
         return results
+
+    def power_action(self, team_name: str, action: str) -> Dict:
+        """Controls power state (start / stop / reboot) of a sandbox instance."""
+        team_name = team_name.strip().lower()
+        action = action.strip().lower()
+        if action in ["start", "on", "activate"]:
+            return self.compute.start_sandbox_vm(team_name)
+        elif action in ["stop", "off", "shutoff", "shutdown"]:
+            return self.compute.stop_sandbox_vm(team_name)
+        elif action in ["reboot", "restart"]:
+            return self.compute.reboot_sandbox_vm(team_name)
+        else:
+            raise ValueError(f"Invalid power action '{action}'. Valid actions: start, stop, reboot.")
+
 

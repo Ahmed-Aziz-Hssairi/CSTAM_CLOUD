@@ -46,7 +46,7 @@ def test_ipam_allocation_and_lease_expiry(tmp_path):
     assert allocs[0]["team_name"] == "team-alpha"
 
     # 3. Wait for lease to expire
-    time.sleep(1.5)
+    time.sleep(2.0)
 
     # 4. Trigger reclamation engine
     reclaimed = ipam.reclaim_expired_leases()
@@ -58,8 +58,42 @@ def test_ipam_allocation_and_lease_expiry(tmp_path):
     assert res_beta["ip_address"] == "192.168.100.10"
 
 
+def test_ipam_idle_traffic_reclamation(tmp_path):
+    """Method 1: Tests auto-reclamation when a sandbox has no traffic/activity for > idle_timeout."""
+    db_file = str(tmp_path / "test_ipam_idle.db")
+    ipam = IPAMService(db_path=db_file, cidr="192.168.100.0/24", start_ip="192.168.100.10", end_ip="192.168.100.15")
+
+    # Allocate with long lease (3600s)
+    ipam.allocate_ip("team-idle", lease_seconds=3600)
+    
+    # Wait 1s and reclaim with 1s idle timeout
+    time.sleep(1.2)
+    reclaimed = ipam.reclaim_expired_leases(idle_timeout_seconds=1)
+    assert len(reclaimed) == 1
+    assert reclaimed[0]["allocated_to"] == "team-idle"
+    assert reclaimed[0]["reclamation_reason"] == "idle_traffic_timeout"
+
+
+def test_ipam_prolonged_shutoff_reclamation(tmp_path):
+    """Method 4: Tests auto-reclamation when an OpenStack VM is stopped/SHUTOFF for > shutoff_timeout."""
+    db_file = str(tmp_path / "test_ipam_shutoff.db")
+    ipam = IPAMService(db_path=db_file, cidr="192.168.100.0/24", start_ip="192.168.100.10", end_ip="192.168.100.15")
+
+    # Allocate VM
+    ipam.allocate_ip("team-stopped", lease_seconds=3600)
+    # OpenStack poll marks instance as SHUTOFF
+    ipam.update_shutoff_state("team-stopped", is_shutoff=True)
+
+    # Wait 1s and trigger reclamation with 1s shutoff timeout
+    time.sleep(1.2)
+    reclaimed = ipam.reclaim_expired_leases(shutoff_timeout_seconds=1)
+    assert len(reclaimed) == 1
+    assert reclaimed[0]["allocated_to"] == "team-stopped"
+    assert reclaimed[0]["reclamation_reason"] == "shutoff_timeout"
+
+
 def test_ipam_api_endpoints():
-    """Tests /ipam/status and /ipam/allocations."""
+    """Tests /ipam/status, /ipam/allocations, and /sandboxes/team/heartbeat."""
     response = client.get("/ipam/status")
     assert response.status_code == 200
     data = response.json()

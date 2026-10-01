@@ -76,3 +76,35 @@ def teardown_sandbox(team_name: str):
 def trigger_reclamation():
     """Triggers the Reclamation Engine to purge expired sandbox leases."""
     return sandbox_service.reclaim_expired()
+
+
+class PowerActionRequest(BaseModel):
+    action: str = Field(..., description="Action to perform: 'start' (activate), 'stop' (shutoff), or 'reboot'")
+
+
+@router.post("/{team_name}/power", response_model=dict)
+def power_sandbox(team_name: str, request: PowerActionRequest):
+    """
+    Controls instance power state on OpenStack:
+    - 'start': Powers on (ACTIVE) a SHUTOFF instance.
+    - 'stop': Powers off (SHUTOFF) an ACTIVE instance.
+    - 'reboot': Reboots the instance.
+    """
+    try:
+        return sandbox_service.power_action(team_name, request.action)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{team_name}/heartbeat", response_model=dict)
+def record_heartbeat(team_name: str):
+    """
+    Records traffic / keep-alive heartbeat from client or HAProxy.
+    Resets the idle inactivity timer so the sandbox remains active while in use.
+    """
+    success = sandbox_service.record_traffic(team_name)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"No active allocation found for team '{team_name}'.")
+    return {"status": "heartbeat_recorded", "team_name": team_name}
+
+

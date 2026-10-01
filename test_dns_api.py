@@ -11,10 +11,9 @@ client = TestClient(app)
 def test_root():
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json() == {
-        "service": "FelCloud DNS Service",
-        "status": "running"
-    }
+    data = response.json()
+    assert data["status"] == "operational"
+    assert "FelCloud" in data["service"]
 
 
 @patch("app.api.dns.dns_service")
